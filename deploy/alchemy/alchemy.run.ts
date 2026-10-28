@@ -334,12 +334,13 @@ export default Alchemy.Stack(
     }
     const workersSubdomain = yield* readWorkersSubdomain({ required: false });
 
-    // Auth needs an absolute BETTER_AUTH_URL. Prod sets it explicitly;
-    // previews always derive it from the deterministic worker name — a wrong
-    // WORKERS_SUBDOMAIN surfaces in CI's post-deploy Access verify step.
+    // Password self-hosts can use a custom domain; hosted previews keep the
+    // deterministic workers.dev URL checked by CI's Access verification.
+    const configuredAuthUrl = yield* optionalVar("BETTER_AUTH_URL");
+    let customDomain: string | undefined;
     let authUrl: string;
     if (prod) {
-      authUrl = yield* optionalVar("BETTER_AUTH_URL");
+      authUrl = configuredAuthUrl;
       if (!authUrl) {
         return yield* Effect.die(
           new Error(
@@ -347,6 +348,25 @@ export default Alchemy.Stack(
           ),
         );
       }
+    } else if (authMode === "password" && configuredAuthUrl) {
+      const publicUrl = z
+        .url({ protocol: /^https$/ })
+        .transform((value) => new URL(value))
+        .refine(
+          (url) =>
+            !url.username &&
+            !url.password &&
+            url.pathname === "/" &&
+            !url.port &&
+            !url.search &&
+            !url.hash,
+          "BETTER_AUTH_URL must be an HTTPS origin without credentials, a path, a port, a query, or a fragment.",
+        )
+        .parse(configuredAuthUrl);
+      authUrl = publicUrl.origin;
+      customDomain = publicUrl.hostname.endsWith(".workers.dev")
+        ? undefined
+        : publicUrl.hostname;
     } else if (workersSubdomain) {
       authUrl = `https://${workerName(stage)}.${workersSubdomain}`;
     } else if (authMode === "password") {
@@ -460,8 +480,9 @@ export default Alchemy.Stack(
 
     const app = yield* Cloudflare.Worker("open-seo", {
       name: workerName(stage),
-      // Prod serves the real domains; the zone is inferred from the hostname.
-      domain: prod ? ["app.openseo.so", "www.app.openseo.so"] : undefined,
+      // Declare the self-host domain too: Alchemy removes undeclared domains
+      // during reconciliation. The zone is inferred from the hostname.
+      domain: prod ? ["app.openseo.so", "www.app.openseo.so"] : customDomain,
       // Prebuilt worker from `vite build` (@cloudflare/vite-plugin). The entry
       // exports the DO + WorkflowEntrypoint classes (re-exported by
       // src/server.ts), which `bundle: false` requires. Sibling chunks under
